@@ -1,0 +1,232 @@
+---
+title: "HDPSA Milestone 1: Data Exploration and Data Dictionary"
+subtitle: "Business Intelligence 371"
+author: "Member 1"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(readxl)
+library(tidyverse)
+library(skimr)
+library(janitor)
+library(knitr)
+```
+
+# Load all datasets
+
+Put the 10 xlsx files in `data/raw/`. This reads every file into a named list,
+so you never hard code file names.
+
+```{r load}
+data_dir <- "data/raw"
+
+files <- list.files(data_dir, pattern = "\\.xlsx$", full.names = TRUE)
+
+datasets <- files |>
+  set_names(~ .x |> basename() |> str_remove("_national_zaf.xlsx")) |>
+  map(read_excel)
+
+tibble(
+  dataset = names(datasets),
+  rows    = map_int(datasets, nrow),
+  columns = map_int(datasets, ncol)
+) |>
+  kable(caption = "Datasets loaded")
+```
+
+# Structure and summary per dataset
+
+```{r structure, results='asis'}
+for (nm in names(datasets)) {
+  cat("\n\n## ", nm, "\n\n")
+  df <- datasets[[nm]]
+  cat("Dimensions:", nrow(df), "rows x", ncol(df), "columns\n\n")
+  print(kable(skim(df)))
+}
+```
+
+# Data quality checks
+
+The teaching data has planted problems. This section finds them automatically
+so nothing is missed. The columns below are rates or times, not 0 to 100
+percentages, so they are excluded from the "over 100" check.
+
+```{r quality-config}
+not_percentage <- c(
+  "RecordID", "SurveyYear",
+  "Under5MortalityRate", "InfantMortalityRate",
+  "MaternalMortalityRate", "CollectionTime"
+)
+```
+
+## Missing values
+
+```{r missing}
+missing_report <- imap_dfr(datasets, function(df, name) {
+  tibble(
+    dataset     = name,
+    variable    = names(df),
+    n_missing   = map_int(df, ~ sum(is.na(.x))),
+    pct_missing = round(map_dbl(df, ~ mean(is.na(.x)) * 100), 1)
+  )
+}) |>
+  filter(n_missing > 0) |>
+  arrange(desc(n_missing))
+
+kable(missing_report, caption = "Columns with missing values")
+```
+
+## Duplicate rows
+
+```{r duplicates}
+imap_dfr(datasets, ~ tibble(dataset = .y, duplicate_rows = sum(duplicated(.x)))) |>
+  kable(caption = "Duplicate row count per dataset")
+```
+
+## Inconsistent categories
+
+Flags text columns where the same value appears in different letter cases,
+for example urban vs Urban.
+
+```{r categories, results='asis'}
+for (nm in names(datasets)) {
+  df <- datasets[[nm]]
+  text_cols <- names(df)[map_lgl(df, is.character)]
+  text_cols <- setdiff(text_cols, "Province")  # Province is consistent
+  for (col in text_cols) {
+    vals <- df[[col]]
+    if (n_distinct(vals) != n_distinct(str_to_lower(vals))) {
+      cat("\n\n**", nm, "->", col, "has case inconsistencies:**\n\n")
+      print(kable(as.data.frame(table(vals))))
+    }
+  }
+}
+```
+
+## Impossible values
+
+Negative values in any measure, and percentages above 100.
+
+```{r invalid}
+invalid_report <- imap_dfr(datasets, function(df, name) {
+  num_cols <- names(df)[map_lgl(df, is.numeric)]
+  map_dfr(num_cols, function(col) {
+    x <- df[[col]]
+    n_negative <- sum(x < 0, na.rm = TRUE)
+    n_over_100 <- if (col %in% not_percentage) 0L else sum(x > 100, na.rm = TRUE)
+    tibble(dataset = name, variable = col, n_negative, n_over_100)
+  })
+}) |>
+  filter(n_negative > 0 | n_over_100 > 0)
+
+kable(invalid_report, caption = "Impossible values found")
+```
+
+# Temporal analysis: 1998 vs 2016
+
+Mean of every numeric indicator by survey year, per dataset.
+
+```{r temporal, results='asis'}
+for (nm in names(datasets)) {
+  df <- datasets[[nm]]
+  summary_tbl <- df |>
+    group_by(SurveyYear) |>
+    summarise(across(where(is.numeric) & !RecordID, ~ round(mean(.x, na.rm = TRUE), 2)),
+              .groups = "drop")
+  cat("\n\n## ", nm, "\n\n")
+  print(kable(summary_tbl))
+}
+```
+
+# Correlations
+
+Correlation between numeric indicators within each dataset (ID and year removed).
+
+```{r correlation, results='asis'}
+for (nm in names(datasets)) {
+  df <- datasets[[nm]] |>
+    select(where(is.numeric), -any_of(c("RecordID", "SurveyYear"))) |>
+    drop_na()
+  if (ncol(df) >= 2) {
+    cat("\n\n## ", nm, "\n\n")
+    print(kable(round(cor(df), 2)))
+  }
+}
+```
+
+# Distributions
+
+Histograms of every numeric indicator, one facet grid per dataset.
+
+```{r distributions, results='asis', fig.width=9, fig.height=5}
+for (nm in names(datasets)) {
+  df <- datasets[[nm]] |>
+    select(where(is.numeric), -any_of(c("RecordID", "SurveyYear"))) |>
+    pivot_longer(everything(), names_to = "variable", values_to = "value")
+  cat("\n\n## ", nm, "\n\n")
+  p <- ggplot(df, aes(value)) +
+    geom_histogram(fill = "steelblue", colour = "white", bins = 30) +
+    facet_wrap(~ variable, scales = "free") +
+    theme_minimal() +
+    labs(title = paste("Distributions:", nm), x = NULL, y = "Count")
+  print(p)
+}
+```
+
+# Data dictionary
+
+Auto builds most columns. Fill description, unit and valid_range by hand using
+the DHS indicator definitions, then export.
+
+```{r dictionary}
+build_dict <- function(df, source_name) {
+  tibble(
+    dataset     = source_name,
+    variable    = names(df),
+    type        = map_chr(df, ~ class(.x)[1]),
+    n_missing   = map_int(df, ~ sum(is.na(.x))),
+    pct_missing = round(map_dbl(df, ~ mean(is.na(.x)) * 100), 1),
+    n_unique    = map_int(df, ~ n_distinct(.x)),
+    example     = map_chr(df, ~ paste(head(na.omit(unique(.x)), 3), collapse = ", ")),
+    description = "",
+    unit        = "",
+    valid_range = ""
+  )
+}
+
+dictionary <- imap_dfr(datasets, build_dict)
+dir.create("outputs", showWarnings = FALSE)
+write_csv(dictionary, "outputs/data_dictionary.csv")
+kable(head(dictionary, 20), caption = "Data dictionary (first 20 rows)")
+```
+
+# Quality summary for Member 2
+
+```{r handoff}
+quality_summary <- imap_dfr(datasets, function(df, name) {
+  tibble(
+    dataset        = name,
+    rows           = nrow(df),
+    columns        = ncol(df),
+    total_missing  = sum(is.na(df)),
+    duplicate_rows = sum(duplicated(df))
+  )
+})
+write_csv(quality_summary, "outputs/quality_summary.csv")
+kable(quality_summary, caption = "Quality summary across all datasets")
+```
+
+# Session info
+
+```{r session}
+sessionInfo()
+```
